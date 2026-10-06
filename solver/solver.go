@@ -26,6 +26,12 @@ const (
 	StatusInvalidInput
 	// StatusCanceled means the context was canceled mid-solve.
 	StatusCanceled
+	// StatusPaused means a segment budget was exhausted before convergence;
+	// the accompanying checkpoint can resume the solve. It is not a failure.
+	StatusPaused
+	// StatusSkipped means a batch-level budget was exhausted before the task
+	// started; the task was never attempted.
+	StatusSkipped
 )
 
 // String renders a status for logs and error messages.
@@ -41,6 +47,10 @@ func (s Status) String() string {
 		return "invalid_input"
 	case StatusCanceled:
 		return "canceled"
+	case StatusPaused:
+		return "paused"
+	case StatusSkipped:
+		return "skipped"
 	default:
 		return "unknown"
 	}
@@ -80,6 +90,9 @@ type Result struct {
 	X           []float64
 	Iterations  int
 	FinalRelRes float64
+	// Tolerance is the (normalized) relative residual threshold the verdict
+	// was judged against.
+	Tolerance float64
 	// History holds relative residual norms at initialization and after
 	// each iteration that made progress.
 	History      []float64
@@ -102,7 +115,7 @@ func DefaultConfig() Config {
 func Solve(ctx context.Context, A *sparse.CSR, b []float64, cfg Config) (*Result, error) {
 	n, err := validate(A, b, &cfg)
 	if err != nil {
-		return &Result{Status: StatusInvalidInput, ErrorMessage: err.Error()}, err
+		return &Result{Status: StatusInvalidInput, Tolerance: cfg.Tolerance, ErrorMessage: err.Error()}, err
 	}
 	if ctx == nil {
 		ctx = context.Background()
@@ -125,6 +138,7 @@ func Solve(ctx context.Context, A *sparse.CSR, b []float64, cfg Config) (*Result
 	default:
 		res = &Result{Status: StatusInvalidInput, ErrorMessage: "unknown method"}
 	}
+	res.Tolerance = cfg.Tolerance
 	// Final guarantee: nothing that did not meet tolerance is "converged".
 	if res.Status == StatusConverged && !(res.FinalRelRes <= cfg.Tolerance) {
 		res.Status = StatusBreakdown
@@ -136,11 +150,14 @@ func Solve(ctx context.Context, A *sparse.CSR, b []float64, cfg Config) (*Result
 }
 
 func canceledResult(cfg Config, err error) *Result {
-	return &Result{Status: StatusCanceled, ErrorMessage: err.Error()}
+	return &Result{Status: StatusCanceled, Tolerance: cfg.Tolerance, ErrorMessage: err.Error()}
 }
 
 // validate normalizes cfg and checks the inputs. It returns the dimension n.
 func validate(A *sparse.CSR, b []float64, cfg *Config) (int, error) {
+	if cfg.Tolerance == 0 {
+		cfg.Tolerance = 1e-8
+	}
 	if A == nil {
 		return 0, &sparse.InputError{Kind: sparse.KindStructure, Message: "nil matrix"}
 	}

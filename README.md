@@ -12,8 +12,8 @@
 | --- | --- |
 | `sparse` | 坐标矩阵（COO）、压缩稀疏行（CSR）、校验与错误分类、矩阵-向量乘 |
 | `mmio` | Matrix Market `coordinate` 格式解析（`real` / `integer` / `pattern`，`general` / `symmetric`） |
-| `solver` | 迭代求解：CG 与重启 GMRES(m)，可选 Jacobi 预条件，统一的状态判定 |
-| `runner` | 固定 worker 数、有界队列的任务池，支持取消、失败隔离、背压 |
+| `solver` | 迭代求解：CG 与重启 GMRES(m)，可选 Jacobi 预条件，统一的状态判定、可归档判定记录、分段续算检查点 |
+| `runner` | 固定 worker 数、有界队列的任务池（取消、失败隔离、背压），以及带共享预算与续跑语义的整批执行 |
 | `cmd/solver` | 本地命令行入口 |
 
 ## 支持的数据形式
@@ -62,12 +62,48 @@ Jacobi 预条件要求对角元全部非零且有限，否则在求解前以数�
 | `StatusMaxIterations` | 步数用尽但残差仍高于容差 |
 | `StatusBreakdown` | 算法失效（CG 非正曲率、GMRES Krylov 基崩溃、出现非有限值） |
 | `StatusInvalidInput` | 矩阵/右端项/配置不合法，同时返回带分类的非空 `error` |
-| `StatusCanceled` | 求解过程中上下文被取消 |
+| `StatusCanceled` | 求解过程中上下文被取消（分段求解时会带回可续算的检查点） |
+| `StatusPaused` | 分段预算用完、尚未收敛也未失败；检查点可续算，**不是**失败 |
+| `StatusSkipped` | 整批预算耗尽时任务尚未开始；任务从未被尝试，**不是**求解失败 |
 
 **任何未满足残差要求的结果都不会被标记为成功**：GMRES 重启后、步数耗尽后都会
 重新计算真实残差，`Solve` 末尾还有 `rel ≤ tol` 的兜底断言。
 
 每次求解返回 `History`（初始相对残差与每步相对残差），供日志与可复现核查。
+
+### 判定记录（`Result.Record()`）
+
+每个 `Result` 都可以导出一份可归档的判定记录 `solver.Record`（带 JSON 标签，
+可直接编进批处理汇总）：
+
+| 字段 | 含义与读法 |
+| --- | --- |
+| `status` | 机读判定：`converged` / `max_iterations` / `breakdown` / `invalid_input` / `canceled` / `paused` / `skipped` |
+| `converged` | 只有「状态为 converged **且**实测残差 ≤ 容差」才为 true；被篡改或不一致的成功标记会被拒绝 |
+| `iterations` | 实际推进的矩阵-向量乘步数（分段求解时为跨段累计值） |
+| `final_rel_res` | 最终实测相对残差 `‖r‖/‖b‖` |
+| `tolerance` | 判定所用的容差（已归一化默认值） |
+| `history` | 收敛走势：初始相对残差与每一步后的相对残差 |
+| `reason` | 人读的判定依据（含残差、容差、步数与失败细节） |
+
+### 分段续算（`SolveSegment` + `Checkpoint`）
+
+`solver.SolveSegment(ctx, A, b, cfg, prev, segmentBudget)` 把一次求解拆成若干段：
+
+- `prev == nil` 从头开始（尊重 `cfg.InitialGuess`）；否则从上一段返回的
+  `Checkpoint` 续算。返回的 `Result` 报告的是**跨段累计**的步数与收敛走势。
+- 段预算用完且尚未收敛/失败时返回 `StatusPaused` 与非空检查点；中途被取消时
+  返回 `StatusCanceled` 与保存了已完成进展的检查点。终止状态（收敛、步数用尽、
+  失效、输入非法）返回空检查点。
+- `cfg.MaxIterations` 是**跨段累计**的总步数上限；总上限耗尽返回
+  `StatusMaxIterations`（终止，不可续算）。
+- **一致性保证**：分段续算与一口气跑完的轨迹完全相同——收敛与否、总步数、
+  最终残差、收敛走势、解向量逐位一致（测试 `TestSegmentedMatchesOneShot` 覆盖
+  CG/GMRES × 是否预条件 × 多种段长）。CG 在任意迭代处切段；GMRES 在重启边界
+  切段，因此单段实际步数最多超出段预算一个重启周期（绝不超出总上限）。
+- 检查点可 JSON 序列化，可落盘后跨进程交接。续算时校验维度、算法、容差、
+  重启长度与预条件设置，不匹配会报错并**原样退回**检查点，已算出的进展
+  不会被破坏，没算完的状态也不会被当成完成。
 
 ## 错误分类
 
@@ -99,6 +135,28 @@ Jacobi 预条件要求对角元全部非零且有限，否则在求解前以数�
 - 求解算法本身无随机性，固定配置、固定输入下重复运行给出逐位一致的结论
   （测试 `TestDeterminism` / `TestDeterministicAcrossRuns` 覆盖）。
 
+## 整批预算与续跑（`runner.RunBatch`）
+
+`runner.RunBatch(ctx, opts, tasks, prev)` 在固定 worker 数下跑整批任务，
+结果**始终按提交顺序返回**，每个任务恰有一份结果，不会悄悄消失。
+
+`BatchOptions.Budget` 给整批设共享上限（零值表示不限）：
+
+- `MaxTotalIterations`：整批所有任务合计的迭代步数上限。`SegmentSize > 0` 时
+  任务按段推进、段间检查预算，预算耗尽时未开始的任务标记 `StatusSkipped`、
+  算了一半的任务带检查点暂停（`StatusPaused`）；`SegmentSize <= 0` 时每个任务
+  单段跑完，预算只在任务之间检查。
+- `MaxElapsed`：整批墙钟上限。到期时在途任务被取消（检查点保留进展）、
+  未开始的任务标记 `StatusSkipped`。
+
+续跑：把上一次返回的结果切片作为 `prev` 再调 `RunBatch`（任务列表需与上次
+按位置一一对应）。已达终止状态（收敛/步数用尽/失效/输入非法）的任务**原样
+保留、绝不重算**；暂停或取消的任务从检查点继续；跳过的任务重新开始。某个
+任务超预算、被跳过或被取消都只影响它自己，其他任务的结论不受影响。
+
+每份 `BatchResult` 可通过 `Record()` 导出判定记录，整批记录可直接
+`json.Marshal` 进汇总文件。
+
 ## 本地验证
 
 要求 Go 1.25+，无需联网（无第三方依赖）。
@@ -109,6 +167,8 @@ go vet ./...
 go test ./...            # 全部单元/并发测试
 go test -race ./...      # 竞态检测
 go test ./... -v         # 查看任务级日志：输入规模、收敛历史摘要、判定依据
+go test ./solver/ -run 'Segment|Record' -v   # 分段续算一致性与判定记录
+go test ./runner/ -run Batch -v              # 整批预算、跳过与续跑
 ```
 
 命令行使用：
@@ -144,5 +204,12 @@ case solver.StatusMaxIterations, solver.StatusBreakdown: // res.History 说明�
   非对称矩阵走 GMRES、零初值残差即收敛；
 - 并发：多种规模（2–128）与 worker 数（1/2/4/8）、任务失败与取消的隔离、
   队列背压、Shutdown 后拒绝提交、结果确定性；
+- 分段续算：CG/GMRES（含预条件）多种段长下与一次性求解的结论逐位一致、
+  总步数上限跨段累计、取消后检查点保留进展并可续算、检查点交接不匹配时
+  报错且原样退回、已知真解场景下续算结果既满足残差要求又逼近真值；
+- 判定记录：收敛/步数用尽/失效/输入非法/取消/暂停/跳过七种结束方式的记录
+  完整且互相可区分，伪造的成功标记会被拒绝；
+- 整批：迭代预算耗尽时未开始任务明确标记为跳过、续跑不重算已完成任务、
+  时间预算到期可续跑、单任务失败/取消不影响其他任务、结果按提交顺序返回；
 - 断言以可复现的相对残差和误差为准；失败日志包含任务名、输入规模、
   收敛历史摘要（首项/末项/长度）与判定依据。

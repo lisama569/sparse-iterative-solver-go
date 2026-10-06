@@ -14,15 +14,58 @@ import (
 // Optional Jacobi right preconditioning solves (A M^-1) y = b and returns
 // x = M^-1 y.
 func solveGMRES(ctx context.Context, A *sparse.CSR, b, x []float64, cfg Config) *Result {
+	c, term := newGMRESCheckpoint(A, b, x, cfg)
+	if term != nil {
+		return term
+	}
+	res, _ := gmresRun(ctx, A, b, cfg, c, cfg.MaxIterations)
+	return res
+}
+
+// newGMRESCheckpoint builds the initial checkpoint for a GMRES solve from
+// the starting vector x. GMRES checkpoints at restart boundaries, so only
+// the current iterate, the iteration count and the trend are needed.
+func newGMRESCheckpoint(A *sparse.CSR, b, x []float64, cfg Config) (*Checkpoint, *Result) {
 	n := len(x)
+	Ax, err := A.MatVec(x)
+	if err != nil {
+		return nil, invalidFrom(err, x)
+	}
+	r := make([]float64, n)
+	for i := 0; i < n; i++ {
+		r[i] = b[i] - Ax[i]
+	}
+	rel := safeRelNorm(r, vnorm(b))
+	c := &Checkpoint{
+		Method:       MethodGMRES,
+		N:            n,
+		Tolerance:    cfg.Tolerance,
+		Restart:      cfg.Restart,
+		Precondition: cfg.Precondition,
+		Rel:          rel,
+		History:      []float64{rel},
+		X:            x,
+	}
+	return c, nil
+}
+
+// gmresRun advances GMRES from checkpoint c. The segment budget is checked at
+// restart boundaries: a cycle that is already running always finishes (never
+// past cfg.MaxIterations total), so a segment may exceed its budget by at
+// most one restart cycle. Because restarts are recomputed from x alone, a
+// segmented solve follows the very same trajectory as an uninterrupted one.
+func gmresRun(ctx context.Context, A *sparse.CSR, b []float64, cfg Config, c *Checkpoint, budget int) (*Result, *Checkpoint) {
+	n := len(c.X)
 	m := cfg.Restart
 	if m > n {
 		m = n
 	}
 	if m <= 0 {
-		return &Result{Status: StatusInvalidInput, X: x, ErrorMessage: "GMRES restart length must be positive"}
+		return &Result{Status: StatusInvalidInput, X: c.X, Tolerance: cfg.Tolerance,
+			ErrorMessage: "GMRES restart length must be positive"}, nil
 	}
-	res := &Result{Status: StatusMaxIterations, X: x}
+	x := c.X
+	res := &Result{Status: StatusMaxIterations, X: x, Tolerance: cfg.Tolerance}
 
 	var diag []float64
 	if cfg.Precondition {
@@ -45,33 +88,72 @@ func solveGMRES(ctx context.Context, A *sparse.CSR, b, x []float64, cfg Config) 
 	}
 
 	bNorm := vnorm(b)
-	total := 0
+	total := c.Iterations
+	rel := c.Rel
+	res.History = append(res.History, c.History...)
+	// boundaryHistLen marks the history entries belonging to completed
+	// restart cycles; a mid-cycle cancellation snapshots only these.
+	boundaryHistLen := len(res.History)
 
-	// Initial residual.
-	Ax, err := A.MatVec(x)
-	if err != nil {
-		return invalidFrom(err, x)
-	}
 	r := make([]float64, n)
-	for i := 0; i < n; i++ {
-		r[i] = b[i] - Ax[i]
+	computeResidual := func() error {
+		Ax, err := A.MatVec(x)
+		if err != nil {
+			return err
+		}
+		for i := 0; i < n; i++ {
+			r[i] = b[i] - Ax[i]
+		}
+		return nil
 	}
-	rel := safeRelNorm(r, bNorm)
-	res.History = append(res.History, rel)
-	if rel <= cfg.Tolerance {
-		res.Status = StatusConverged
-		res.FinalRelRes = rel
-		return res
+	if err := computeResidual(); err != nil {
+		return invalidFrom(err, x), nil
+	}
+	rel = safeRelNorm(r, bNorm)
+
+	snapshot := func() *Checkpoint {
+		return &Checkpoint{
+			Method:       MethodGMRES,
+			N:            n,
+			Iterations:   total,
+			Tolerance:    cfg.Tolerance,
+			Restart:      cfg.Restart,
+			Precondition: cfg.Precondition,
+			Rel:          rel,
+			History:      append([]float64(nil), res.History[:boundaryHistLen]...),
+			X:            append([]float64(nil), x...),
+		}
 	}
 
-	for total < cfg.MaxIterations {
+	startTotal := total
+	for {
+		if rel <= cfg.Tolerance {
+			res.Status = StatusConverged
+			res.FinalRelRes = rel
+			res.Iterations = total
+			return res, nil
+		}
+		if total >= cfg.MaxIterations {
+			// Budget exhausted: report an explicitly measured residual.
+			res.FinalRelRes = rel
+			res.History = append(res.History, rel)
+			res.Iterations = total
+			return res, nil
+		}
+		if total-startTotal >= budget {
+			res.Status = StatusPaused
+			res.FinalRelRes = rel
+			res.Iterations = total
+			return res, snapshot()
+		}
+
 		beta := vnorm(r)
 		if beta == 0 || math.IsNaN(beta) {
 			res.Status = StatusBreakdown
 			res.ErrorMessage = "GMRES residual norm not usable: " + floatStr(beta)
 			res.FinalRelRes = rel
 			res.Iterations = total
-			return res
+			return res, nil
 		}
 
 		// V holds m+1 Krylov vectors; H is upper Hessenberg (m+1 x m)
@@ -92,20 +174,20 @@ func solveGMRES(ctx context.Context, A *sparse.CSR, b, x []float64, cfg Config) 
 				res.ErrorMessage = ctx.Err().Error()
 				res.FinalRelRes = rel
 				res.Iterations = total
-				return res
+				return res, snapshot()
 			default:
 			}
 
 			w, err := amp(V[j])
 			if err != nil {
-				return invalidFrom(err, x)
+				return invalidFrom(err, x), nil
 			}
 			if !finiteVec(w) {
 				res.Status = StatusBreakdown
 				res.ErrorMessage = "non-finite Arnoldi vector"
 				res.FinalRelRes = math.NaN()
 				res.Iterations = total
-				return res
+				return res, nil
 			}
 			// Modified Gram-Schmidt.
 			for i := 0; i <= j; i++ {
@@ -143,13 +225,13 @@ func solveGMRES(ctx context.Context, A *sparse.CSR, b, x []float64, cfg Config) 
 					res.FinalRelRes = rel
 					res.Iterations = total
 					res.History = append(res.History, rel)
-					return res
+					return res, nil
 				}
 				res.Status = StatusBreakdown
 				res.ErrorMessage = "GMRES breakdown: zero Krylov basis norm without convergence"
 				res.FinalRelRes = rel
 				res.Iterations = total
-				return res
+				return res, nil
 			}
 			// New rotation G_j with c = h1/d, s = h2/d zeroes H[j+1,j]:
 			// (h1,h2) -> (c*h1+s*h2, -s*h1+c*h2) = (d,0).
@@ -171,7 +253,7 @@ func solveGMRES(ctx context.Context, A *sparse.CSR, b, x []float64, cfg Config) 
 				res.Status = StatusConverged
 				res.FinalRelRes = rel
 				res.Iterations = total
-				return res
+				return res, nil
 			}
 			if hnorm == 0 {
 				// Invariant subspace reached without convergence: more
@@ -180,7 +262,7 @@ func solveGMRES(ctx context.Context, A *sparse.CSR, b, x []float64, cfg Config) 
 				res.ErrorMessage = "GMRES breakdown: invariant Krylov subspace before convergence"
 				res.FinalRelRes = rel
 				res.Iterations = total
-				return res
+				return res, nil
 			}
 			V[j+1] = scale(1/hnorm, w)
 		}
@@ -191,35 +273,13 @@ func solveGMRES(ctx context.Context, A *sparse.CSR, b, x []float64, cfg Config) 
 		y := backSolve(H, g, j, m)
 		x = axpyIntoX(x, applyMinv(mulV(V, y, j)))
 		res.X = x
-		Ax, err = A.MatVec(x)
-		if err != nil {
-			return invalidFrom(err, x)
-		}
-		for i := 0; i < n; i++ {
-			r[i] = b[i] - Ax[i]
+		if err := computeResidual(); err != nil {
+			return invalidFrom(err, x), nil
 		}
 		rel = safeRelNorm(r, bNorm)
 		res.History = append(res.History, rel)
-		if rel <= cfg.Tolerance {
-			res.Status = StatusConverged
-			res.FinalRelRes = rel
-			res.Iterations = total
-			return res
-		}
+		boundaryHistLen = len(res.History)
 	}
-	// Budget exhausted: report an explicitly measured residual.
-	Ax, _ = A.MatVec(x)
-	for i := 0; i < n; i++ {
-		r[i] = b[i] - Ax[i]
-	}
-	res.X = x
-	res.FinalRelRes = safeRelNorm(r, bNorm)
-	res.History = append(res.History, res.FinalRelRes)
-	res.Iterations = total
-	if res.FinalRelRes <= cfg.Tolerance {
-		res.Status = StatusConverged
-	}
-	return res
 }
 
 func safeScale(resid, bNorm float64) float64 {
@@ -270,7 +330,7 @@ func axpyIntoX(x, add []float64) []float64 {
 
 func scale(a float64, x []float64) []float64 {
 	y := make([]float64, len(x))
-	for i := range x {
+	for i := range y {
 		y[i] = a * x[i]
 	}
 	return y
