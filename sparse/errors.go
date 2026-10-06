@@ -26,6 +26,9 @@ type InputError struct {
 
 func (e *InputError) Error() string { return kindName(e.Kind) + ": " + e.Message }
 
+// String renders the machine-readable category for reports and logs.
+func (k ErrorKind) String() string { return kindName(k) }
+
 func kindName(k ErrorKind) string {
 	switch k {
 	case KindFormat:

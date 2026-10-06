@@ -26,7 +26,28 @@ const (
 	StatusInvalidInput
 	// StatusCanceled means the context was canceled mid-solve.
 	StatusCanceled
+	// StatusPaused means a segment reached its per-segment step cap before a
+	// terminal conclusion; the returned Progress lets a later Advance call
+	// continue. A paused solve is never a success: the residual was still
+	// above the tolerance.
+	StatusPaused
+	// StatusSkipped is only produced by batch runners (never by Solve): the
+	// task never started because the batch budget or deadline was exhausted,
+	// or the batch context was canceled before its turn.
+	StatusSkipped
 )
+
+// Terminal reports whether the status is a final conclusion. Only
+// StatusConverged is a success; StatusPaused is resumable, StatusSkipped
+// means "never started".
+func (s Status) Terminal() bool {
+	switch s {
+	case StatusConverged, StatusMaxIterations, StatusBreakdown, StatusInvalidInput, StatusCanceled:
+		return true
+	default:
+		return false
+	}
+}
 
 // String renders a status for logs and error messages.
 func (s Status) String() string {
@@ -41,6 +62,10 @@ func (s Status) String() string {
 		return "invalid_input"
 	case StatusCanceled:
 		return "canceled"
+	case StatusPaused:
+		return "paused"
+	case StatusSkipped:
+		return "skipped"
 	default:
 		return "unknown"
 	}
@@ -73,17 +98,37 @@ type Config struct {
 	Method Method
 }
 
-// Result is the outcome of a solve. A result only reports StatusConverged
-// when the final relative residual was measured to be <= Tolerance.
+// Result is the outcome of a solve (or of one segment). A result only
+// reports StatusConverged when the final relative residual was measured to
+// be <= Tolerance.
 type Result struct {
 	Status      Status
 	X           []float64
 	Iterations  int
 	FinalRelRes float64
+	// SegmentIterations is the number of steps advanced by this call alone
+	// (0 for batch results that were reused from a previous batch run).
+	SegmentIterations int
 	// History holds relative residual norms at initialization and after
-	// each iteration that made progress.
+	// each iteration that made progress. For segmented solves every segment
+	// shares the cumulative history, so the complete trajectory is available
+	// even when it is assembled from several calls.
 	History      []float64
 	ErrorMessage string
+	// Basis is a short machine/human-readable statement of why Status was
+	// reached ("residual 1.2e-9 <= tolerance 1e-8", "iteration budget 100
+	// exhausted with residual ...", ...).
+	Basis string
+	// Progress, when non-nil, carries resumable solver state. It is set for
+	// StatusPaused and StatusCanceled (a canceled segment keeps everything
+	// computed so far) and must be nil for every terminal status.
+	Progress *Progress
+
+	// recordTol is the tolerance actually applied; it backs Report so an
+	// archived record can judge the residual without the original Config.
+	recordTol float64
+	// recordMethod is the algorithm actually used.
+	recordMethod Method
 }
 
 // DefaultConfig returns a usable default configuration (tol 1e-8,
@@ -100,43 +145,22 @@ func DefaultConfig() Config {
 // with the corresponding status. The matrix is only read, so the same
 // *sparse.CSR can safely be shared between concurrent Solve calls.
 func Solve(ctx context.Context, A *sparse.CSR, b []float64, cfg Config) (*Result, error) {
-	n, err := validate(A, b, &cfg)
-	if err != nil {
-		return &Result{Status: StatusInvalidInput, ErrorMessage: err.Error()}, err
-	}
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if err := ctx.Err(); err != nil {
-		return canceledResult(cfg, err), nil
+	// One-shot solve is exactly one segment with no per-segment cap; the
+	// total cfg.MaxIterations budget applies.
+	res, err := Advance(ctx, A, b, cfg, nil, 0)
+	if res == nil {
+		return res, err
 	}
-
-	x := make([]float64, n)
-	if cfg.InitialGuess != nil {
-		copy(x, cfg.InitialGuess)
+	// A one-shot solve can never legitimately pause: no segment cap.
+	if res.Status == StatusPaused {
+		res.Status = StatusMaxIterations
+		res.Basis = maxItersBasis(cfg.MaxIterations, res.FinalRelRes, res.recordTol)
+		res.Progress = nil
 	}
-
-	var res *Result
-	switch cfg.Method {
-	case MethodCG:
-		res = solveCG(ctx, A, b, x, cfg)
-	case MethodGMRES:
-		res = solveGMRES(ctx, A, b, x, cfg)
-	default:
-		res = &Result{Status: StatusInvalidInput, ErrorMessage: "unknown method"}
-	}
-	// Final guarantee: nothing that did not meet tolerance is "converged".
-	if res.Status == StatusConverged && !(res.FinalRelRes <= cfg.Tolerance) {
-		res.Status = StatusBreakdown
-		if res.ErrorMessage == "" {
-			res.ErrorMessage = "internal: convergence flag inconsistent with measured residual"
-		}
-	}
-	return res, nil
-}
-
-func canceledResult(cfg Config, err error) *Result {
-	return &Result{Status: StatusCanceled, ErrorMessage: err.Error()}
+	return res, err
 }
 
 // validate normalizes cfg and checks the inputs. It returns the dimension n.

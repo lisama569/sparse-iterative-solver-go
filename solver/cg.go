@@ -7,134 +7,179 @@ import (
 	"github.com/lisama569/sparse-iterative-solver-go/sparse"
 )
 
-// solveCG runs (optionally Jacobi-preconditioned) conjugate gradients.
+// cgState is a resumable conjugate-gradients checkpoint.
 //
-// CG assumes a symmetric positive definite operator. On a matrix that is
-// symmetric but not positive definite (or with a poor preconditioner) the
-// method breaks down when p^T A p <= 0; that is reported as
-// StatusBreakdown rather than convergence.
-func solveCG(ctx context.Context, A *sparse.CSR, b, x []float64, cfg Config) *Result {
-	n := len(x)
-	res := &Result{Status: StatusMaxIterations, X: x}
+// Every checkpoint boundary sits between iterations, so (x, r, p, z, rz)
+// are always mutually consistent: r = b - A*x as last computed, p is the
+// current search direction and rz = r·z. A paused or canceled segment can
+// therefore resume with bit-identical arithmetic; concatenating segments is
+// the same computation as a one-shot solve.
+type cgState struct {
+	cfg  Config
+	n    int
+	diag []float64 // nil without Jacobi preconditioning
+	bn   float64   // ||b||
 
-	var diag []float64
+	x, r, p, Ap, z []float64
+	rz             float64
+
+	iter      int
+	rel       float64 // last MEASURED relative residual
+	history   []float64
+	errDetail string
+}
+
+// newCGState performs CG initialization (initial residual, first
+// preconditioned direction). The returned status is terminal (convergence at
+// iteration 0, immediate breakdown) or StatusPaused acting as the
+// "ready to step" sentinel.
+func newCGState(cfg Config, A *sparse.CSR, b, x0 []float64) (*cgState, Status, error) {
+	n := len(x0)
+	s := &cgState{cfg: cfg, n: n}
 	if cfg.Precondition {
-		diag = A.Diagonal()
+		s.diag = A.Diagonal()
 	}
-	applyP := func(z, r []float64) {
-		if cfg.Precondition {
-			for i := 0; i < n; i++ {
-				z[i] = r[i] / diag[i]
-			}
-			return
-		}
-		copy(z, r)
-	}
+	s.x = make([]float64, n)
+	copy(s.x, x0)
 
-	r := make([]float64, n)
-	p := make([]float64, n)
-	Ap := make([]float64, n)
-	z := make([]float64, n)
-
-	Ax, err := A.MatVec(x)
+	Ax, err := A.MatVec(s.x)
 	if err != nil {
-		return invalidFrom(err, x)
+		return s, StatusInvalidInput, err
 	}
-	bNorm := vnorm(b)
+	s.bn = vnorm(b)
+	s.r = make([]float64, n)
 	for i := 0; i < n; i++ {
-		r[i] = b[i] - Ax[i]
+		s.r[i] = b[i] - Ax[i]
 	}
-	rel := safeRelNorm(r, bNorm)
-	res.History = append(res.History, rel)
-	if rel <= cfg.Tolerance {
-		res.Status = StatusConverged
-		res.FinalRelRes = rel
-		return res
-	}
-
-	applyP(z, r)
-	copy(p, z)
-	rz := vdot(r, z)
-	if rz <= 0 || math.IsNaN(rz) {
-		res.Status = StatusBreakdown
-		res.ErrorMessage = "preconditioned residual inner product non-positive: " + floatStr(rz)
-		res.FinalRelRes = rel
-		return res
+	s.rel = safeRelNorm(s.r, s.bn)
+	s.history = append(s.history, s.rel)
+	if s.rel <= cfg.Tolerance {
+		s.errDetail = "initial guess already satisfies the residual requirement"
+		return s, StatusConverged, nil
 	}
 
-	for iter := 1; iter <= cfg.MaxIterations; iter++ {
-		select {
-		case <-ctx.Done():
-			res.Status = StatusCanceled
-			res.ErrorMessage = ctx.Err().Error()
-			res.FinalRelRes = rel
-			res.Iterations = iter - 1
-			return res
-		default:
+	s.p = make([]float64, n)
+	s.z = make([]float64, n)
+	s.Ap = make([]float64, n)
+	s.applyPrecond(s.z, s.r)
+	copy(s.p, s.z)
+	s.rz = vdot(s.r, s.z)
+	if math.IsNaN(s.rz) || s.rz <= 0 {
+		s.errDetail = "preconditioned residual inner product non-positive: " + floatStr(s.rz)
+		return s, StatusBreakdown, nil
+	}
+	return s, StatusPaused, nil // sentinel: ready, not actually paused
+}
+
+func (s *cgState) applyPrecond(z, r []float64) {
+	if s.cfg.Precondition {
+		for i := 0; i < s.n; i++ {
+			z[i] = r[i] / s.diag[i]
 		}
-		if !finiteVec(r) || !finiteVec(p) {
-			res.Status = StatusBreakdown
-			res.ErrorMessage = "non-finite residual or search direction"
-			res.FinalRelRes = math.NaN()
-			res.Iterations = iter - 1
-		}
+		return
+	}
+	copy(z, r)
+}
 
-		Ap, err = A.MatVec(p)
+func (s *cgState) iterations() int { return s.iter }
+func (s *cgState) relRes() float64 { return s.rel }
+func (s *cgState) method() Method  { return MethodCG }
+
+// advance performs up to maxSteps CG iterations. When the step allowance is
+// exhausted it returns StatusMaxIterations if atTotalCap (the global budget
+// is used up) or StatusPaused (resumable) otherwise.
+func (s *cgState) advance(ctx context.Context, A *sparse.CSR, b []float64, maxSteps int, atTotalCap bool) Status {
+	for k := 0; k < maxSteps; k++ {
+		if err := ctx.Err(); err != nil {
+			s.errDetail = err.Error()
+			return StatusCanceled
+		}
+		if !finiteVec(s.r) || !finiteVec(s.p) {
+			s.errDetail = "non-finite residual or search direction"
+			s.rel = math.NaN()
+			return StatusBreakdown
+		}
+		var err error
+		s.Ap, err = A.MatVec(s.p)
 		if err != nil {
-			return invalidFrom(err, x)
+			s.errDetail = err.Error()
+			return StatusInvalidInput
 		}
-		pAp := vdot(p, Ap)
+		pAp := vdot(s.p, s.Ap)
 		if math.IsNaN(pAp) || math.IsInf(pAp, 0) || pAp <= 0 {
 			// Non-positive curvature: A is not SPD along p, or rounding
 			// destroyed conjugacy. CG cannot continue reliably.
-			res.Status = StatusBreakdown
-			res.ErrorMessage = "non-positive curvature p^T A p = " + floatStr(pAp)
-			res.FinalRelRes = rel
-			res.Iterations = iter - 1
-			return res
+			s.errDetail = "non-positive curvature p^T A p = " + floatStr(pAp)
+			return StatusBreakdown
 		}
-		alpha := rz / pAp
-		for i := 0; i < n; i++ {
-			x[i] += alpha * p[i]
-			r[i] -= alpha * Ap[i]
+		alpha := s.rz / pAp
+		for i := 0; i < s.n; i++ {
+			s.x[i] += alpha * s.p[i]
+			s.r[i] -= alpha * s.Ap[i]
 		}
-		if !finiteVec(r) {
-			res.Status = StatusBreakdown
-			res.ErrorMessage = "non-finite residual after update"
-			res.FinalRelRes = math.NaN()
-			res.Iterations = iter
-			return res
+		if !finiteVec(s.r) {
+			s.errDetail = "non-finite residual after update"
+			s.rel = math.NaN()
+			s.iter++
+			return StatusBreakdown
 		}
-		rel = safeRelNorm(r, bNorm)
-		res.History = append(res.History, rel)
-		if rel <= cfg.Tolerance {
-			res.Status = StatusConverged
-			res.FinalRelRes = rel
-			res.Iterations = iter
-			return res
+		s.rel = safeRelNorm(s.r, s.bn)
+		s.history = append(s.history, s.rel)
+		s.iter++
+		if s.rel <= s.cfg.Tolerance {
+			return StatusConverged
 		}
-		applyP(z, r)
-		rzNew := vdot(r, z)
+		s.applyPrecond(s.z, s.r)
+		rzNew := vdot(s.r, s.z)
 		if rzNew <= 0 {
-			res.Status = StatusBreakdown
-			res.ErrorMessage = "preconditioned residual inner product non-positive after update"
-			res.FinalRelRes = rel
-			res.Iterations = iter
-			return res
+			s.errDetail = "preconditioned residual inner product non-positive after update"
+			return StatusBreakdown
 		}
-		beta := rzNew / rz
+		beta := rzNew / s.rz
 		if math.IsNaN(beta) || math.IsInf(beta, 0) {
-			res.Status = StatusBreakdown
-			res.ErrorMessage = "non-finite beta in CG update"
-			res.FinalRelRes = rel
-			res.Iterations = iter
-			return res
+			s.errDetail = "non-finite beta in CG update"
+			return StatusBreakdown
 		}
-		for i := 0; i < n; i++ {
-			p[i] = z[i] + beta*p[i]
+		for i := 0; i < s.n; i++ {
+			s.p[i] = s.z[i] + beta*s.p[i]
 		}
-		rz = rzNew
+		s.rz = rzNew
 	}
-	res.FinalRelRes = rel
-	return res
+	// Step allowance exhausted. The residual is measured every iteration,
+	// so s.rel is an up-to-date measured value.
+	if atTotalCap {
+		return StatusMaxIterations
+	}
+	return StatusPaused
+}
+
+// measure recomputes ||b - A*x||/||b|| from scratch (CG does so every step,
+// so this is just the cached value; kept for driver uniformity).
+func (s *cgState) measure(_ *sparse.CSR, _ []float64) float64 { return s.rel }
+
+// checkCompatible verifies that a continuation uses the same problem shape
+// and the same decisive configuration as the segment that produced p.
+func (s *cgState) checkCompatible(cfg Config, n int) error {
+	if s.n != n {
+		return ErrProgressMismatch
+	}
+	if cfg.Method != MethodCG || !s.cfg.match(cfg) {
+		return ErrProgressMismatch
+	}
+	return nil
+}
+
+// clone returns a deep copy so the Progress handed to a caller cannot be
+// mutated when the caller chooses to continue from the same checkpoint
+// more than once or archives the result alongside further segments.
+func (s *cgState) clone() *cgState {
+	c := *s
+	c.x = cloneFloats(s.x)
+	c.r = cloneFloats(s.r)
+	c.p = cloneFloats(s.p)
+	c.Ap = cloneFloats(s.Ap)
+	c.z = cloneFloats(s.z)
+	c.diag = cloneFloats(s.diag)
+	c.history = append([]float64(nil), s.history...)
+	return &c
 }

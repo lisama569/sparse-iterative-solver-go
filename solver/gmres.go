@@ -7,219 +7,332 @@ import (
 	"github.com/lisama569/sparse-iterative-solver-go/sparse"
 )
 
-// solveGMRES runs restarted GMRES(m) with modified Gram-Schmidt Arnoldi
-// and Givens-rotation least squares. It makes no symmetry assumption and
-// therefore applies to general (non-symmetric) square systems.
+// gmresState is a resumable restarted GMRES(m) checkpoint using modified
+// Gram-Schmidt Arnoldi and Givens-rotation least squares.
 //
-// Optional Jacobi right preconditioning solves (A M^-1) y = b and returns
-// x = M^-1 y.
-func solveGMRES(ctx context.Context, A *sparse.CSR, b, x []float64, cfg Config) *Result {
-	n := len(x)
+// A checkpoint can sit either at a cycle boundary (j == 0, r is the exact
+// residual of x) or INSIDE a cycle (0 < j < m: the Arnoldi basis V, upper
+// Hessenberg H and Givens state are retained). The stored x always equals
+// the committed cycle-start iterate; the best-fit correction of an
+// unfinished cycle is computed on demand for residual measurement and again
+// at the terminal step, so resuming an unfinished cycle performs exactly
+// the same arithmetic as a one-shot solve.
+type gmresState struct {
+	cfg  Config
+	n, m int
+	diag []float64 // nil without Jacobi (right) preconditioning
+	bn   float64   // ||b||
+
+	x []float64 // committed solution at the current cycle start
+	r []float64 // exact residual at the current cycle start
+
+	V         [][]float64 // m+1 Krylov vectors
+	H         []float64   // (m+1) x m, column-major, stride m
+	cs, sn, g []float64
+	j         int // completed Arnoldi steps in the current cycle
+	iter      int // total matrix-vector products
+	rel       float64
+	history   []float64
+	errDetail string
+}
+
+// newGMRESState validates the restart length and measures the initial
+// residual. StatusConverged means the initial guess already satisfies the
+// tolerance; otherwise StatusPaused is the "ready to step" sentinel.
+func newGMRESState(cfg Config, A *sparse.CSR, b, x0 []float64) (*gmresState, Status, error) {
+	n := len(x0)
 	m := cfg.Restart
 	if m > n {
 		m = n
 	}
+	s := &gmresState{cfg: cfg, n: n, m: m}
 	if m <= 0 {
-		return &Result{Status: StatusInvalidInput, X: x, ErrorMessage: "GMRES restart length must be positive"}
+		s.errDetail = "GMRES restart length must be positive"
+		return s, StatusInvalidInput, nil
 	}
-	res := &Result{Status: StatusMaxIterations, X: x}
-
-	var diag []float64
 	if cfg.Precondition {
-		diag = A.Diagonal()
+		s.diag = A.Diagonal()
 	}
-	applyMinv := func(v []float64) []float64 {
-		out := make([]float64, n)
-		if cfg.Precondition {
-			for i := 0; i < n; i++ {
-				out[i] = v[i] / diag[i]
-			}
-		} else {
-			copy(out, v)
-		}
-		return out
-	}
-	// amp computes w = A M^-1 v.
-	amp := func(v []float64) ([]float64, error) {
-		return A.MatVec(applyMinv(v))
-	}
+	s.x = make([]float64, n)
+	copy(s.x, x0)
 
-	bNorm := vnorm(b)
-	total := 0
-
-	// Initial residual.
-	Ax, err := A.MatVec(x)
+	Ax, err := A.MatVec(s.x)
 	if err != nil {
-		return invalidFrom(err, x)
+		return s, StatusInvalidInput, err
 	}
-	r := make([]float64, n)
+	s.bn = vnorm(b)
+	s.r = make([]float64, n)
 	for i := 0; i < n; i++ {
-		r[i] = b[i] - Ax[i]
+		s.r[i] = b[i] - Ax[i]
 	}
-	rel := safeRelNorm(r, bNorm)
-	res.History = append(res.History, rel)
-	if rel <= cfg.Tolerance {
-		res.Status = StatusConverged
-		res.FinalRelRes = rel
-		return res
+	s.rel = safeRelNorm(s.r, s.bn)
+	s.history = append(s.history, s.rel)
+	if s.rel <= cfg.Tolerance {
+		s.errDetail = "initial guess already satisfies the residual requirement"
+		return s, StatusConverged, nil
 	}
+	return s, StatusPaused, nil
+}
 
-	for total < cfg.MaxIterations {
-		beta := vnorm(r)
-		if beta == 0 || math.IsNaN(beta) {
-			res.Status = StatusBreakdown
-			res.ErrorMessage = "GMRES residual norm not usable: " + floatStr(beta)
-			res.FinalRelRes = rel
-			res.Iterations = total
-			return res
+func (s *gmresState) iterations() int { return s.iter }
+func (s *gmresState) relRes() float64 { return s.rel }
+func (s *gmresState) method() Method  { return MethodGMRES }
+func (s *gmresState) detail() string  { return s.errDetail }
+
+func (s *gmresState) applyMinv(v []float64) []float64 {
+	out := make([]float64, s.n)
+	if s.cfg.Precondition {
+		for i := 0; i < s.n; i++ {
+			out[i] = v[i] / s.diag[i]
 		}
+	} else {
+		copy(out, v)
+	}
+	return out
+}
 
-		// V holds m+1 Krylov vectors; H is upper Hessenberg (m+1 x m)
-		// stored column-major with stride m.
-		V := make([][]float64, m+1)
-		V[0] = scale(1/beta, r)
-		H := make([]float64, (m+1)*m)
-		cs := make([]float64, m)
-		sn := make([]float64, m)
-		g := make([]float64, m+1)
-		g[0] = beta
+// amp computes w = A M^-1 v.
+func (s *gmresState) amp(A *sparse.CSR, v []float64) ([]float64, error) {
+	return A.MatVec(s.applyMinv(v))
+}
 
-		j := 0
-		for ; j < m && total < cfg.MaxIterations; j++ {
-			select {
-			case <-ctx.Done():
-				res.Status = StatusCanceled
-				res.ErrorMessage = ctx.Err().Error()
-				res.FinalRelRes = rel
-				res.Iterations = total
-				return res
-			default:
+// startCycle initializes a fresh Arnoldi cycle from the exact residual r.
+func (s *gmresState) startCycle() {
+	beta := vnorm(s.r)
+	s.V = make([][]float64, s.m+1)
+	s.V[0] = scale(1/beta, s.r)
+	s.H = make([]float64, (s.m+1)*s.m)
+	s.cs = make([]float64, s.m)
+	s.sn = make([]float64, s.m)
+	s.g = make([]float64, s.m+1)
+	s.g[0] = beta
+	s.j = 0
+}
+
+// trialX returns x + M^-1 * (V_k y), the best-fit iterate of the current
+// cycle, WITHOUT committing it.
+func (s *gmresState) trialX(k int) []float64 {
+	y := backSolve(s.H, s.g, k, s.m)
+	x := cloneFloats(s.x)
+	return axpyIntoX(x, s.applyMinv(mulV(s.V, y, k)))
+}
+
+// measure computes the measured relative residual of a candidate iterate.
+func (s *gmresState) measure(A *sparse.CSR, b, x []float64) float64 {
+	Ax, _ := A.MatVec(x)
+	rr := make([]float64, s.n)
+	for i := 0; i < s.n; i++ {
+		rr[i] = b[i] - Ax[i]
+	}
+	return safeRelNorm(rr, s.bn)
+}
+
+// boundaryRitual performs the pause/terminal/cancel bookkeeping at a cycle
+// boundary or in the middle of a cycle: form the best-fit iterate, MEASURE
+// the true residual and record one explicit history point. The committed
+// cycle-start state is preserved (pass commit=false) so an unfinished cycle
+// can resume bit-identically; a true restart (commit=true) resets the cycle
+// from the measured residual.
+func (s *gmresState) boundaryRitual(A *sparse.CSR, b []float64, commit bool) float64 {
+	xt := s.trialX(s.j)
+	rel := s.measure(A, b, xt)
+	s.rel = rel
+	s.history = append(s.history, rel)
+	if commit {
+		s.x = xt
+		Ax, _ := A.MatVec(s.x)
+		for i := 0; i < s.n; i++ {
+			s.r[i] = b[i] - Ax[i]
+		}
+		s.V = nil
+		s.j = 0
+	}
+	return rel
+}
+
+// advance performs up to maxSteps matrix-vector steps. atTotalCap reports
+// whether this allowance reaches cfg.MaxIterations (terminal budget) rather
+// than a per-segment cap (pause).
+func (s *gmresState) advance(ctx context.Context, A *sparse.CSR, b []float64, maxSteps int, atTotalCap bool) Status {
+	totalCap := s.cfg.MaxIterations
+
+	// Resume inside an unfinished cycle, or start the first one.
+	if s.j > 0 {
+		// nothing to initialize
+	} else {
+		beta := vnorm(s.r)
+		if beta == 0 || math.IsNaN(beta) {
+			// Exact-zero residual at a non-initial point must have been
+			// caught when measured; NaN means arithmetic is unusable.
+			s.rel = safeRelNorm(s.r, s.bn)
+			if s.rel <= s.cfg.Tolerance {
+				return StatusConverged
 			}
+			s.errDetail = "GMRES residual norm not usable: " + floatStr(beta)
+			return StatusBreakdown
+		}
+		s.startCycle()
+	}
 
-			w, err := amp(V[j])
+	stepsLeft := maxSteps
+	for stepsLeft > 0 && s.iter < totalCap {
+		// Finish the current cycle (possibly resumed mid-cycle), then
+		// restart until the allowance is used.
+		for s.j < s.m && stepsLeft > 0 && s.iter < totalCap {
+			if err := ctx.Err(); err != nil {
+				// Keep everything earned: measured best-fit iterate plus a
+				// resumable checkpoint of the unfinished cycle.
+				s.boundaryRitual(A, b, false)
+				s.errDetail = err.Error()
+				return StatusCanceled
+			}
+			w, err := s.amp(A, s.V[s.j])
 			if err != nil {
-				return invalidFrom(err, x)
+				s.errDetail = err.Error()
+				return StatusInvalidInput
 			}
 			if !finiteVec(w) {
-				res.Status = StatusBreakdown
-				res.ErrorMessage = "non-finite Arnoldi vector"
-				res.FinalRelRes = math.NaN()
-				res.Iterations = total
-				return res
+				s.errDetail = "non-finite Arnoldi vector"
+				s.rel = math.NaN()
+				return StatusBreakdown
 			}
 			// Modified Gram-Schmidt.
-			for i := 0; i <= j; i++ {
-				hij := vdot(w, V[i])
-				H[i*m+j] = hij
-				w = axpy(-hij, V[i], w)
+			for i := 0; i <= s.j; i++ {
+				hij := vdot(w, s.V[i])
+				s.H[i*s.m+s.j] = hij
+				w = axpy(-hij, s.V[i], w)
 			}
 			hnorm := vnorm(w)
-			H[(j+1)*m+j] = hnorm
+			s.H[(s.j+1)*s.m+s.j] = hnorm
 
-			// Apply previously computed Givens rotations G_i to column j.
-			// The two affected rows transform as
+			// Apply previous Givens rotations to this column:
 			// (a,b) -> (c*a + s*b, -s*a + c*b).
-			for i := 0; i < j; i++ {
-				h1 := H[i*m+j]
-				h2 := H[(i+1)*m+j]
-				H[i*m+j] = cs[i]*h1 + sn[i]*h2
-				H[(i+1)*m+j] = -sn[i]*h1 + cs[i]*h2
+			for i := 0; i < s.j; i++ {
+				h1 := s.H[i*s.m+s.j]
+				h2 := s.H[(i+1)*s.m+s.j]
+				s.H[i*s.m+s.j] = s.cs[i]*h1 + s.sn[i]*h2
+				s.H[(i+1)*s.m+s.j] = -s.sn[i]*h1 + s.cs[i]*h2
 			}
-			h1 := H[j*m+j]
-			h2 := H[(j+1)*m+j]
+			h1 := s.H[s.j*s.m+s.j]
+			h2 := s.H[(s.j+1)*s.m+s.j]
 			denom := math.Hypot(h1, h2)
 			if denom == 0 || math.IsNaN(denom) {
-				// Lucky breakdown: A-invariant Krylov subspace. The least
-				// squares residual |g[j+1]| (which stays at |g[j]| since
-				// the rotation is undefined) tells us whether the solve
-				// actually succeeded.
-				resid := math.Abs(g[j])
-				rel = safeScale(resid, bNorm)
-				if rel <= cfg.Tolerance {
-					y := backSolve(H, g, j, m)
-					x = axpyIntoX(x, applyMinv(mulV(V, y, j)))
-					res.X = x
-					res.Status = StatusConverged
-					res.FinalRelRes = rel
-					res.Iterations = total
-					res.History = append(res.History, rel)
-					return res
+				// Lucky breakdown: A-invariant Krylov subspace. Decide on
+				// the MEASURED residual of the best-fit iterate.
+				resid := math.Abs(s.g[s.j])
+				relProj := safeScale(resid, s.bn)
+				s.history = append(s.history, relProj)
+				s.iter++
+				stepsLeft--
+				rel := s.measure(A, b, s.trialX(s.j))
+				s.rel = rel
+				if rel <= s.cfg.Tolerance {
+					s.x = s.trialX(s.j)
+					return StatusConverged
 				}
-				res.Status = StatusBreakdown
-				res.ErrorMessage = "GMRES breakdown: zero Krylov basis norm without convergence"
-				res.FinalRelRes = rel
-				res.Iterations = total
-				return res
+				s.errDetail = "GMRES breakdown: zero Krylov basis norm without convergence"
+				return StatusBreakdown
 			}
-			// New rotation G_j with c = h1/d, s = h2/d zeroes H[j+1,j]:
-			// (h1,h2) -> (c*h1+s*h2, -s*h1+c*h2) = (d,0).
-			cs[j] = h1 / denom
-			sn[j] = h2 / denom
-			H[j*m+j] = denom
-			H[(j+1)*m+j] = 0
-			gj := g[j]
-			g[j] = cs[j]*gj + sn[j]*g[j+1]
-			g[j+1] = -sn[j]*gj + cs[j]*g[j+1]
+			// New rotation G_j zeroes H[j+1,j]:
+			// (h1,h2) -> (d,0) with d = hypot(h1,h2).
+			s.cs[s.j] = h1 / denom
+			s.sn[s.j] = h2 / denom
+			s.H[s.j*s.m+s.j] = denom
+			s.H[(s.j+1)*s.m+s.j] = 0
+			gj := s.g[s.j]
+			s.g[s.j] = s.cs[s.j]*gj + s.sn[s.j]*s.g[s.j+1]
+			s.g[s.j+1] = -s.sn[s.j]*gj + s.cs[s.j]*s.g[s.j+1]
 
-			total++
-			rel = safeScale(math.Abs(g[j+1]), bNorm)
-			res.History = append(res.History, rel)
-			if rel <= cfg.Tolerance {
-				y := backSolve(H, g, j+1, m)
-				x = axpyIntoX(x, applyMinv(mulV(V, y, j+1)))
-				res.X = x
-				res.Status = StatusConverged
-				res.FinalRelRes = rel
-				res.Iterations = total
-				return res
+			s.iter++
+			stepsLeft--
+			relProj := safeScale(math.Abs(s.g[s.j+1]), s.bn)
+			s.history = append(s.history, relProj)
+			if relProj <= s.cfg.Tolerance {
+				// Projected claim: verify with an explicit measurement.
+				xt := s.trialX(s.j + 1)
+				rel := s.measure(A, b, xt)
+				if rel <= s.cfg.Tolerance {
+					s.x = xt
+					s.rel = rel
+					return StatusConverged
+				}
+				// Projected residual was optimistic: commit the best-fit
+				// iterate and start a fresh cycle with the exact residual.
+				s.rel = rel
+				s.history = append(s.history, rel)
+				s.x = xt
+				Ax, _ := A.MatVec(s.x)
+				for i := 0; i < s.n; i++ {
+					s.r[i] = b[i] - Ax[i]
+				}
+				if s.iter >= totalCap {
+					if rel <= s.cfg.Tolerance {
+						return StatusConverged
+					}
+					return StatusMaxIterations
+				}
+				beta := vnorm(s.r)
+				if beta == 0 || math.IsNaN(beta) {
+					if rel <= s.cfg.Tolerance {
+						return StatusConverged
+					}
+					s.errDetail = "GMRES residual norm not usable: " + floatStr(beta)
+					return StatusBreakdown
+				}
+				s.startCycle()
+				continue
 			}
 			if hnorm == 0 {
-				// Invariant subspace reached without convergence: more
+				// Invariant subspace reached without convergence: further
 				// restarts cannot change the result.
-				res.Status = StatusBreakdown
-				res.ErrorMessage = "GMRES breakdown: invariant Krylov subspace before convergence"
-				res.FinalRelRes = rel
-				res.Iterations = total
-				return res
+				s.boundaryRitual(A, b, false)
+				s.errDetail = "GMRES breakdown: invariant Krylov subspace before convergence"
+				return StatusBreakdown
 			}
-			V[j+1] = scale(1/hnorm, w)
+			s.V[s.j+1] = scale(1/hnorm, w)
+			s.j++
 		}
 
-		// Restart: update x with the best approximation so far and
-		// recompute the true residual explicitly (never trust only the
-		// projected residual across a restart).
-		y := backSolve(H, g, j, m)
-		x = axpyIntoX(x, applyMinv(mulV(V, y, j)))
-		res.X = x
-		Ax, err = A.MatVec(x)
-		if err != nil {
-			return invalidFrom(err, x)
+		if s.iter >= totalCap || stepsLeft == 0 {
+			break
 		}
-		for i := 0; i < n; i++ {
-			r[i] = b[i] - Ax[i]
+
+		// Full cycle complete: commit the least-squares update and restart
+		// from the explicitly recomputed true residual.
+		rel := s.boundaryRitual(A, b, true)
+		if rel <= s.cfg.Tolerance {
+			return StatusConverged
 		}
-		rel = safeRelNorm(r, bNorm)
-		res.History = append(res.History, rel)
-		if rel <= cfg.Tolerance {
-			res.Status = StatusConverged
-			res.FinalRelRes = rel
-			res.Iterations = total
-			return res
+		beta := vnorm(s.r)
+		if beta == 0 || math.IsNaN(beta) {
+			s.errDetail = "GMRES residual norm not usable: " + floatStr(beta)
+			return StatusBreakdown
 		}
+		s.startCycle()
 	}
-	// Budget exhausted: report an explicitly measured residual.
-	Ax, _ = A.MatVec(x)
-	for i := 0; i < n; i++ {
-		r[i] = b[i] - Ax[i]
+
+	// Allowance exhausted. Measure the best-fit iterate WITHOUT destroying
+	// an unfinished cycle: committing only happens at genuine cycle
+	// boundaries, so segmented runs are arithmetically identical to a
+	// one-shot solve.
+	rel := s.boundaryRitual(A, b, s.j >= s.m)
+	if rel <= s.cfg.Tolerance {
+		return StatusConverged
 	}
-	res.X = x
-	res.FinalRelRes = safeRelNorm(r, bNorm)
-	res.History = append(res.History, res.FinalRelRes)
-	res.Iterations = total
-	if res.FinalRelRes <= cfg.Tolerance {
-		res.Status = StatusConverged
+	if atTotalCap {
+		return StatusMaxIterations
 	}
-	return res
+	return StatusPaused
+}
+
+func (s *gmresState) checkCompatible(cfg Config, n int) error {
+	if s.n != n {
+		return ErrProgressMismatch
+	}
+	if cfg.Method != MethodGMRES || !s.cfg.match(cfg) {
+		return ErrProgressMismatch
+	}
+	return nil
 }
 
 func safeScale(resid, bNorm float64) float64 {
@@ -247,15 +360,15 @@ func mulV(V [][]float64, y []float64, k int) []float64 {
 func backSolve(H, g []float64, k, m int) []float64 {
 	y := make([]float64, k)
 	for i := k - 1; i >= 0; i-- {
-		s := g[i]
+		su := g[i]
 		for jj := i + 1; jj < k; jj++ {
-			s -= H[i*m+jj] * y[jj]
+			su -= H[i*m+jj] * y[jj]
 		}
 		d := H[i*m+i]
 		if d == 0 {
 			y[i] = 0
 		} else {
-			y[i] = s / d
+			y[i] = su / d
 		}
 	}
 	return y
@@ -282,4 +395,27 @@ func axpy(a float64, x, y []float64) []float64 {
 		z[i] = a*x[i] + y[i]
 	}
 	return z
+}
+
+// clone returns a deep copy of the checkpoint, including an unfinished
+// Arnoldi cycle, so an archived Progress keeps its exact measured state.
+func (s *gmresState) clone() *gmresState {
+	c := *s
+	c.x = cloneFloats(s.x)
+	c.r = cloneFloats(s.r)
+	c.diag = cloneFloats(s.diag)
+	c.history = append([]float64(nil), s.history...)
+	if s.V != nil {
+		c.V = make([][]float64, len(s.V))
+		for i := range s.V {
+			if s.V[i] != nil {
+				c.V[i] = cloneFloats(s.V[i])
+			}
+		}
+		c.H = cloneFloats(s.H)
+		c.cs = cloneFloats(s.cs)
+		c.sn = cloneFloats(s.sn)
+		c.g = cloneFloats(s.g)
+	}
+	return &c
 }

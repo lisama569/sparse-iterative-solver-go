@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/lisama569/sparse-iterative-solver-go/solver"
 	"github.com/lisama569/sparse-iterative-solver-go/sparse"
@@ -26,6 +27,12 @@ type TaskResult struct {
 	Name   string
 	Result *solver.Result
 	Err    error
+	// State distinguishes fresh computation, reuse across batch resumes and
+	// tasks that never started (skipped due to batch limits).
+	State TaskState
+	// Duration is the wall-clock time spent computing in this batch run
+	// (zero for reused/skipped tasks).
+	Duration time.Duration
 }
 
 // entry is one unit of internal work.
